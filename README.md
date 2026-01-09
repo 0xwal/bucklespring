@@ -3,6 +3,8 @@ Nostalgia bucklespring keyboard sound
 
 Copyright 2016 Ico Doornekamp
 
+Fork with additional features: custom sound pack support and press-only mode.
+
 This project emulates the sound of my old faithful IBM Model-M space saver
 bucklespring keyboard while typing on my notebook, mainly for the purpose of
 annoying the hell out of my coworkers.
@@ -149,8 +151,49 @@ options:
   -l        list available openAL audio devices
   -p PATH   load .wav files from directory PATH
   -s WIDTH  set stereo width [0..100]
+  -u        don't play sound on key release (press-only mode)
   -v        increase verbosity / debugging
 ````
+
+## Custom Sound Packs
+
+Bucklespring now supports **Mechvibes-compatible** sound pack configurations through a `config.json` file in the audio directory. This allows you to use sound packs designed for Mechvibes and other keyboard sound simulators by mapping specific key codes to custom audio files.
+
+### Config.json Format
+
+Create a `config.json` file in your audio directory with the following structure:
+
+```json
+{
+    "id": "custom-sound-pack-123",
+    "name": "My Custom Keyboard Sounds",
+    "defines": {
+        "1": "custom-key1.wav",
+        "14": "custom-backspace.wav",
+        "29": "custom-ctrl.wav"
+    }
+}
+```
+
+The `defines` object maps key codes (as strings) to audio filenames. When a key with the specified code is pressed, bucklespring will use the custom audio file instead of the default naming scheme.
+
+### Mechvibes Compatibility
+
+This feature is specifically designed to work with **Mechvibes sound packs**. Simply place the `config.json` file from any Mechvibes sound pack in your audio directory, and bucklespring will automatically use the custom key mappings.
+
+The audio files should be in standard WAV format (16-bit PCM, 44.1kHz, mono) as used by Mechvibes.
+
+Mechvibes sound packs can be found on various keyboard enthusiast communities and GitHub repositories.
+
+## Additional Options
+
+### Press-Only Mode
+
+The `--press-only` (`-u`) option disables audio playback for key release events, playing sounds only when keys are pressed down. This can create a different typing experience and reduce audio clutter.
+
+```
+$ ./buckle --press-only
+```
 
 OpenAL notes
 ------------
