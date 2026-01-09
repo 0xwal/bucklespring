@@ -21,6 +21,7 @@
 #endif
 
 #include "buckle.h"
+#include "json.h"
 
 #define SRC_INVALID INT_MAX
 #define DEFAULT_MUTE_KEYCODE 0x46 /* Scroll Lock */
@@ -36,6 +37,7 @@
 static void usage(char *exe);
 static void list_devices(void);
 static double find_key_loc(int code);
+static char* get_audio_file_from_config(int code);
 
 
 
@@ -76,7 +78,7 @@ static int opt_mute_keycode = DEFAULT_MUTE_KEYCODE;
 static const char *opt_device = NULL;
 static const char *opt_path_audio = PATH_AUDIO;
 static int muted = 0;
-
+static struct json_value_s *config_json_cache = NULL;
 
 static const char short_opts[] = "d:fg:hlm:Mp:s:cv";
 
@@ -202,6 +204,81 @@ out:
 	return rv;
 }
 
+static char* get_audio_file_from_config(int code) {
+	if (!config_json_cache) {
+		char config_path[512];
+		snprintf(config_path, sizeof(config_path), "%s/config.json", opt_path_audio);
+
+		FILE *file = fopen(config_path, "r");
+		if (!file) {
+			return NULL;
+		}
+
+		fseek(file, 0, SEEK_END);
+		long file_size = ftell(file);
+		fseek(file, 0, SEEK_SET);
+
+		if (file_size <= 0) {
+			fclose(file);
+			return NULL;
+		}
+
+		char *json_content = malloc(file_size + 1);
+		if (!json_content) {
+			fclose(file);
+			return NULL;
+		}
+
+		size_t bytes_read = fread(json_content, 1, file_size, file);
+		fclose(file);
+
+		if (bytes_read != (size_t)file_size) {
+			free(json_content);
+			return NULL;
+		}
+
+		json_content[file_size] = '\0';
+		config_json_cache = json_parse(json_content, file_size);
+		free(json_content);
+
+		if (!config_json_cache) {
+			return NULL;
+		}
+	}
+
+	struct json_object_s *root = json_value_as_object(config_json_cache);
+	if (!root) return NULL;
+
+	struct json_object_element_s *defines_elem = root->start;
+	while (defines_elem) {
+		if (strcmp(defines_elem->name->string, "defines") == 0) {
+			struct json_object_s *defines_obj = json_value_as_object(defines_elem->value);
+			if (!defines_obj) return NULL;
+
+			char code_str[32];
+			snprintf(code_str, sizeof(code_str), "%d", code);
+
+			struct json_object_element_s *elem = defines_obj->start;
+			while (elem) {
+				if (strcmp(elem->name->string, code_str) == 0) {
+					struct json_string_s *value_str = json_value_as_string(elem->value);
+					if (value_str) {
+						char *result = malloc(value_str->string_size + 1);
+						if (result) {
+							strcpy(result, value_str->string);
+							return result;
+						}
+					}
+				}
+				elem = elem->next;
+			}
+			break;
+		}
+		defines_elem = defines_elem->next;
+	}
+
+	return NULL;
+}
 
 static void usage(char *exe)
 {
@@ -437,12 +514,17 @@ int play(int code, int press)
 	static ALuint src[512] = { 0 };
 
 	int idx = code + press * 256;
+	char *custom_name = NULL;
 
 	if(src[idx] == 0) {
-		char *name = map_code_to_name(code);
-
 		char fname[256];
-		snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
+		custom_name = get_audio_file_from_config(code);
+		if (custom_name) {
+			snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, custom_name);
+		} else {
+			char *name = map_code_to_name(code);
+			snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
+		}
 
 		printd("Loading audio file \"%s\"", fname);
 
@@ -482,6 +564,7 @@ int play(int code, int press)
 		TEST_ERROR("source playing");
 	}
 
+	if (custom_name) free(custom_name);
 	return 0;
 }
 
