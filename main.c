@@ -311,6 +311,109 @@ static void handle_mute_key(int mute_key)
 	}
 }
 
+static char* map_code_to_name(unsigned int code) {
+	switch (code) {
+		/* Row 1: Function Keys & Esc */
+		case 1:   return "ESC";
+		case 59:  return "F1";
+		case 60:  return "F2";
+		case 61:  return "F3";
+		case 62:  return "F4";
+		case 63:  return "F5";
+		case 64:  return "F6";
+		case 65:  return "F7";
+		case 66:  return "F8";
+		case 67:  return "F9";
+		case 68:  return "F10";
+		case 87:  return "F11";
+		case 88:  return "F12";
+
+		/* Row 2: Numbers */
+		case 41:  return "GRAVE/TILDE";
+		case 2:   return "1";
+		case 3:   return "2";
+		case 4:   return "3";
+		case 5:   return "4";
+		case 6:   return "5";
+		case 7:   return "6";
+		case 8:   return "7";
+		case 9:   return "8";
+		case 10:  return "9";
+		case 11:  return "0";
+		case 12:  return "MINUS";
+		case 13:  return "EQUAL";
+		case 14:  return "backspace";
+
+		/* Row 3: QWERTY */
+		case 15:  return "tab";
+		case 16:  return "q";
+		case 17:  return "w";
+		case 18:  return "e";
+		case 19:  return "r";
+		case 20:  return "t";
+		case 21:  return "y";
+		case 22:  return "u";
+		case 23:  return "i";
+		case 24:  return "o";
+		case 25:  return "p";
+		case 26:  return "[";  /* This is your code 26 */
+		case 27:  return "]";
+		case 43:  return "backspace";
+
+		/* Row 4: ASDF */
+		case 58:  return "caps lock";
+		case 30:  return "a";
+		case 31:  return "s";
+		case 32:  return "d";
+		case 33:  return "f";
+		case 34:  return "g";
+		case 35:  return "h";
+		case 36:  return "j";
+		case 37:  return "k";
+		case 38:  return "l";
+		case 39:  return "SEMICOLON";
+		case 40:  return "APOSTROPHE";
+		case 28:  return "enter";
+
+		/* Row 5: ZXCV */
+		case 42:  return "shift";
+		case 44:  return "z";
+		case 45:  return "x";
+		case 46:  return "c";
+		case 47:  return "v";
+		case 48:  return "b";
+		case 49:  return "n";
+		case 50:  return "m";
+		case 51:  return "COMMA";
+		case 52:  return "DOT";
+		case 53:  return "SLASH";
+		case 54:  return "shift";
+
+		/* Row 6: Modifiers & Space */
+		case 29:  return "LEFTCTRL";
+		case 125: return "LEFTMETA";   /* Windows Key */
+		case 56:  return "LEFTALT";
+		case 57:  return "space";
+		case 100: return "RIGHTALT";
+		case 97:  return "RIGHTCTRL";
+
+		/* Navigation block */
+		case 103: return "UP";
+		case 108: return "DOWN";
+		case 105: return "LEFT";
+		case 106: return "RIGHT";
+		case 110: return "INSERT";
+		case 111: return "DELETE";
+		case 102: return "HOME";
+		case 107: return "END";
+		case 104: return "PAGEUP";
+		case 109: return "PAGEDOWN";
+		case 70:  return "SCROLLLOCK"; /* Bucklespring default mute */
+
+		default:  return "UNKNOWN";
+	}
+}
+
 
 /*
  * Play audio file for given keycode. Wav files are loaded on demand
@@ -336,9 +439,10 @@ int play(int code, int press)
 	int idx = code + press * 256;
 
 	if(src[idx] == 0) {
+		char *name = map_code_to_name(code);
 
 		char fname[256];
-		snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, code, press);
+		snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
 
 		printd("Loading audio file \"%s\"", fname);
 
@@ -346,7 +450,7 @@ int play(int code, int press)
 		if(buf[idx] == 0) {
 
 			if(opt_fallback_sound) {
-				snprintf(fname, sizeof(fname), "%s/%02x-%d.wav", opt_path_audio, 0x31, press);
+				snprintf(fname, sizeof(fname), "%s/fallback.wav", opt_path_audio);
 				buf[idx] = alureCreateBufferFromFile(fname);
 			} else {
 				fprintf(stderr, "Error opening audio file \"%s\": %s\n", fname, alureGetErrorString());
