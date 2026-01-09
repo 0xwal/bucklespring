@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <getopt.h>
 #include <time.h>
+#include <sys/stat.h>
 
 #ifdef __APPLE__
 #include <OpenAL/al.h>
@@ -38,6 +39,7 @@ static void usage(char *exe);
 static void list_devices(void);
 static double find_key_loc(int code);
 static char* get_audio_file_from_config(int code);
+static void cleanup_json_cache(void);
 
 
 
@@ -77,11 +79,20 @@ static int opt_gain = 100;
 static int opt_fallback_sound = 0;
 static int opt_mute_keycode = DEFAULT_MUTE_KEYCODE;
 static const char *opt_device = NULL;
-static const char *opt_path_audio = PATH_AUDIO;
+static const char *opt_wav_dir = PATH_AUDIO;
+static const char *opt_pack_name = NULL;
+static char opt_path_audio[PATH_MAX] = PATH_AUDIO;
 static int muted = 0;
 static struct json_value_s *config_json_cache = NULL;
 
-static const char short_opts[] = "d:fg:hlm:Mp:s:cuv";
+static void cleanup_json_cache(void) {
+	if (config_json_cache) {
+		free(config_json_cache);
+		config_json_cache = NULL;
+	}
+}
+
+static const char short_opts[] = "d:fg:hlm:Mp:s:cuvw:";
 
 static const struct option long_opts[] = {
 	{ "device",         required_argument, NULL, 'd' },
@@ -91,11 +102,12 @@ static const struct option long_opts[] = {
 	{ "list-devices",   no_argument,       NULL, 'l' },
 	{ "mute-keycode",   required_argument, NULL, 'm' },
 	{ "mute",           no_argument,       NULL, 'M' },
-	{ "audio-path",     required_argument, NULL, 'p' },
+	{ "pack",           required_argument, NULL, 'p' },
 	{ "stereo-width",   required_argument, NULL, 's' },
 	{ "no-click",       no_argument,       NULL, 'c' },
 	{ "press-only",     no_argument,       NULL, 'u' },
 	{ "verbose",        no_argument,       NULL, 'v' },
+	{ "wav-dir",        required_argument, NULL, 'w' },
         { 0, 0, 0, 0 }
 };
 
@@ -132,7 +144,10 @@ int main(int argc, char **argv)
 				muted = !muted;
 				break;
 			case 'p':
-				opt_path_audio = optarg;
+				opt_pack_name = optarg;
+				break;
+			case 'w':
+				opt_wav_dir = optarg;
 				break;
 			case 's':
 				opt_stereo_width = atoi(optarg);
@@ -151,6 +166,40 @@ int main(int argc, char **argv)
 				return 1;
 				break;
 		}
+	}
+
+	/* Path to data files can also be specified by environment, this is
+	 * used by the snap package */
+	const char *env_path = getenv("BUCKLESPRING_WAV_DIR");
+	if (env_path) {
+		opt_wav_dir = env_path;
+	}
+
+	/* Validate wav directory exists */
+	struct stat st;
+	if (stat(opt_wav_dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "Error: wav directory \"%s\" does not exist or is not a directory\n", opt_wav_dir);
+		return EXIT_FAILURE;
+	}
+
+	/* Construct full audio path: wav_dir/pack_name if pack_name specified */
+	if (opt_pack_name) {
+		int result = snprintf(opt_path_audio, sizeof(opt_path_audio), "%s/%s", opt_wav_dir, opt_pack_name);
+		if (result < 0 || result >= sizeof(opt_path_audio)) {
+			fprintf(stderr, "Error: constructed audio path too long\n");
+			return EXIT_FAILURE;
+		}
+		if (stat(opt_path_audio, &st) != 0 || !S_ISDIR(st.st_mode)) {
+			fprintf(stderr, "Error: pack directory \"%s\" does not exist or is not a directory\n", opt_path_audio);
+			return EXIT_FAILURE;
+		}
+	} else {
+		if (strlen(opt_wav_dir) >= sizeof(opt_path_audio)) {
+			fprintf(stderr, "Error: wav directory path too long\n");
+			return EXIT_FAILURE;
+		}
+		strncpy(opt_path_audio, opt_wav_dir, sizeof(opt_path_audio) - 1);
+		opt_path_audio[sizeof(opt_path_audio) - 1] = '\0';
 	}
 
 	if(opt_verbose) {
@@ -188,19 +237,12 @@ int main(int argc, char **argv)
 	alListener3f(AL_VELOCITY, 0, 0, 0);
 	alListenerfv(AL_ORIENTATION, listenerOri);
 
-	/* Path to data files can also be specified by environment, this is
-	 * used by the snap package */
-
-	const char *env_path = getenv("BUCKLESPRING_WAV_DIR");
-	if (env_path) {
-		opt_path_audio = env_path;
-	}
-
-	printd("Using wav dir: \"%s\"\n", opt_path_audio);
+	printd("Using audio path: \"%s\"\n", opt_path_audio);
 
 	scan(opt_verbose);
 
 out:
+	cleanup_json_cache();
 	device = alcGetContextsDevice(context);
 	alcMakeContextCurrent(NULL);
 	if(context) alcDestroyContext(context);
@@ -211,8 +253,11 @@ out:
 
 static char* get_audio_file_from_config(int code) {
 	if (!config_json_cache) {
-		char config_path[512];
-		snprintf(config_path, sizeof(config_path), "%s/config.json", opt_path_audio);
+		char config_path[PATH_MAX];
+		int result = snprintf(config_path, sizeof(config_path), "%s/config.json", opt_path_audio);
+		if (result < 0 || result >= sizeof(config_path)) {
+			return NULL;
+		}
 
 		FILE *file = fopen(config_path, "r");
 		if (!file) {
@@ -299,12 +344,13 @@ static void usage(char *exe)
 		"  -m, --mute-keycode=CODE   use CODE as mute key (default 0x46 for scroll lock)\n"
 		"  -M, --mute                start the program muted\n"
 		"  -c, --no-click            don't play a sound on mouse click\n"
+		"  -p, --pack=NAME           load sound pack NAME from wav directory\n"
 		"  -u, --press-only          don't play sound on key release\n"
 		"  -h, --help                show help\n"
 		"  -l, --list-devices        list available OpenAL audio devices\n"
-		"  -p, --audio-path=PATH     load .wav files from directory PATH\n"
 		"  -s, --stereo-width=WIDTH  set stereo width [0..100]\n"
-		"  -v, --verbose             increase verbosity / debugging\n",
+		"  -v, --verbose             increase verbosity / debugging\n"
+		"  -w, --wav-dir=DIR         set base wav directory (default ./wav)\n",
 		exe
        );
 }
@@ -525,13 +571,22 @@ int play(int code, int press)
 	char *custom_name = NULL;
 
 	if(src[idx] == 0) {
-		char fname[256];
+		char fname[PATH_MAX];
 		custom_name = get_audio_file_from_config(code);
 		if (custom_name) {
-			snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, custom_name);
+			int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, custom_name);
+			if (result < 0 || result >= sizeof(fname)) {
+				free(custom_name);
+				src[idx] = SRC_INVALID;
+				return -1;
+			}
 		} else {
 			char *name = map_code_to_name(code);
-			snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
+			int result = snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
+			if (result < 0 || result >= sizeof(fname)) {
+				src[idx] = SRC_INVALID;
+				return -1;
+			}
 		}
 
 		printd("Loading audio file \"%s\"", fname);
@@ -540,7 +595,11 @@ int play(int code, int press)
 		if(buf[idx] == 0) {
 
 			if(opt_fallback_sound) {
-				snprintf(fname, sizeof(fname), "%s/fallback.wav", opt_path_audio);
+				int result = snprintf(fname, sizeof(fname), "%s/fallback.wav", opt_path_audio);
+				if (result < 0 || result >= sizeof(fname)) {
+					src[idx] = SRC_INVALID;
+					return -1;
+				}
 				buf[idx] = alureCreateBufferFromFile(fname);
 			} else {
 				fprintf(stderr, "Error opening audio file \"%s\": %s\n", fname, alureGetErrorString());
