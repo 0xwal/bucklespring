@@ -12,6 +12,16 @@
 #include <time.h>
 #include <sys/stat.h>
 
+#define OGG_IMPL
+#define VORBIS_IMPL
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmisleading-indentation"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
+#include "minivorbis.h"
+#pragma GCC diagnostic pop
+
 #ifdef __APPLE__
 #include <OpenAL/al.h>
 #include <OpenAL/alure.h>
@@ -27,6 +37,18 @@
 #define SRC_INVALID INT_MAX
 #define DEFAULT_MUTE_KEYCODE 0x46 /* Scroll Lock */
 
+#define MAX_CACHED_FILES 16
+#define MAX_AUDIO_SAMPLES 4 * 48000 * 60
+
+typedef struct {
+    char filename[PATH_MAX];
+    short *samples;
+    int sample_count;
+    int sample_rate;
+    int channels;
+    int ref_count;
+} cached_audio_file_t;
+
 #define TEST_ERROR(_msg)		\
 	error = alGetError();		\
 	if (error != AL_NO_ERROR) {	\
@@ -38,8 +60,16 @@
 static void usage(char *exe);
 static void list_devices(void);
 static double find_key_loc(int code);
-static char* get_audio_file_from_config(int code);
 static void cleanup_json_cache(void);
+static void cleanup_audio_cache(void);
+static void parse_config_json(void);
+static char* get_audio_file_from_config(int code);
+static int get_audio_segment_from_config(int code, int *start_ms, int *duration_ms);
+static cached_audio_file_t* get_cached_audio_file(const char *filename);
+static ALuint create_buffer_from_ogg_segment(const char *filename, int start_ms, int duration_ms);
+
+static cached_audio_file_t cached_audio_files[MAX_CACHED_FILES];
+static int cached_audio_count = 0;
 
 
 
@@ -84,12 +114,308 @@ static const char *opt_pack_name = NULL;
 static char opt_path_audio[PATH_MAX] = PATH_AUDIO;
 static int muted = 0;
 static struct json_value_s *config_json_cache = NULL;
+static int config_key_define_type_single = 0;
+static char *config_main_sound_file = NULL;
 
 static void cleanup_json_cache(void) {
 	if (config_json_cache) {
 		free(config_json_cache);
 		config_json_cache = NULL;
 	}
+	if (config_main_sound_file) {
+		free(config_main_sound_file);
+		config_main_sound_file = NULL;
+	}
+	config_key_define_type_single = 0;
+}
+
+static void cleanup_audio_cache(void) {
+    int i;
+    for (i = 0; i < cached_audio_count; i++) {
+        if (cached_audio_files[i].samples) {
+            free(cached_audio_files[i].samples);
+            cached_audio_files[i].samples = NULL;
+        }
+    }
+    cached_audio_count = 0;
+}
+
+static void parse_config_json(void) {
+    if (config_json_cache) return;
+
+    char config_path[PATH_MAX];
+    int result = snprintf(config_path, sizeof(config_path), "%s/config.json", opt_path_audio);
+    if (result < 0 || result >= sizeof(config_path)) {
+        return;
+    }
+
+    FILE *file = fopen(config_path, "r");
+    if (!file) {
+        return;
+    }
+
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    if (file_size <= 0) {
+        fclose(file);
+        return;
+    }
+
+    char *json_content = malloc(file_size + 1);
+    if (!json_content) {
+        fclose(file);
+        return;
+    }
+
+    size_t bytes_read = fread(json_content, 1, file_size, file);
+    fclose(file);
+
+    if (bytes_read != (size_t)file_size) {
+        free(json_content);
+        return;
+    }
+
+    json_content[file_size] = '\0';
+    config_json_cache = json_parse(json_content, file_size);
+    free(json_content);
+
+    if (!config_json_cache) {
+        return;
+    }
+
+    struct json_object_s *root = json_value_as_object(config_json_cache);
+    if (!root) return;
+
+    struct json_object_element_s *elem = root->start;
+    while (elem) {
+        if (strcmp(elem->name->string, "key_define_type") == 0) {
+            struct json_string_s *type_str = json_value_as_string(elem->value);
+            if (type_str && strcmp(type_str->string, "single") == 0) {
+                config_key_define_type_single = 1;
+            }
+        } else if (strcmp(elem->name->string, "sound") == 0) {
+            struct json_string_s *sound_str = json_value_as_string(elem->value);
+            if (sound_str) {
+                config_main_sound_file = strdup(sound_str->string);
+            }
+        }
+        elem = elem->next;
+    }
+}
+
+static char* get_audio_file_from_config(int code) {
+    parse_config_json();
+    if (!config_json_cache) return NULL;
+
+    struct json_object_s *root = json_value_as_object(config_json_cache);
+    if (!root) return NULL;
+
+    struct json_object_element_s *defines_elem = root->start;
+    while (defines_elem) {
+        if (strcmp(defines_elem->name->string, "defines") == 0) {
+            struct json_object_s *defines_obj = json_value_as_object(defines_elem->value);
+            if (!defines_obj) return NULL;
+
+            char code_str[32];
+            snprintf(code_str, sizeof(code_str), "%d", code);
+
+            struct json_object_element_s *elem = defines_obj->start;
+            while (elem) {
+                if (strcmp(elem->name->string, code_str) == 0) {
+                    struct json_string_s *value_str = json_value_as_string(elem->value);
+                    if (value_str) {
+                        char *result = malloc(value_str->string_size + 1);
+                        if (result) {
+                            strcpy(result, value_str->string);
+                            return result;
+                        }
+                    }
+                }
+                elem = elem->next;
+            }
+            break;
+        }
+        defines_elem = defines_elem->next;
+    }
+
+    return NULL;
+}
+
+static int get_audio_segment_from_config(int code, int *start_ms, int *duration_ms) {
+    parse_config_json();
+
+    if (!config_key_define_type_single || !config_json_cache) {
+        return 0;
+    }
+
+    struct json_object_s *root = json_value_as_object(config_json_cache);
+    if (!root) return 0;
+
+    struct json_object_element_s *defines_elem = root->start;
+    while (defines_elem) {
+        if (strcmp(defines_elem->name->string, "defines") == 0) {
+            struct json_object_s *defines_obj = json_value_as_object(defines_elem->value);
+            if (!defines_obj) return 0;
+
+            char code_str[32];
+            snprintf(code_str, sizeof(code_str), "%d", code);
+
+            struct json_object_element_s *code_elem = defines_obj->start;
+            while (code_elem) {
+                if (strcmp(code_elem->name->string, code_str) == 0) {
+                    struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
+                    if (segment_arr && segment_arr->length >= 2) {
+                        struct json_array_element_s *start_elem = segment_arr->start;
+                        struct json_array_element_s *duration_elem = start_elem->next;
+
+                        if (start_elem && duration_elem) {
+                            struct json_number_s *start_num = json_value_as_number(start_elem->value);
+                            struct json_number_s *duration_num = json_value_as_number(duration_elem->value);
+                            if (start_num && duration_num) {
+                                *start_ms = (int)strtod(start_num->number, NULL);
+                                *duration_ms = (int)strtod(duration_num->number, NULL);
+                                return 1;
+                            }
+                        }
+                    }
+                }
+                code_elem = code_elem->next;
+            }
+            break;
+        }
+        defines_elem = defines_elem->next;
+    }
+
+    return 0;
+}
+
+static cached_audio_file_t* get_cached_audio_file(const char *filename) {
+    int i;
+    for (i = 0; i < cached_audio_count; i++) {
+        if (strcmp(cached_audio_files[i].filename, filename) == 0) {
+            cached_audio_files[i].ref_count++;
+            return &cached_audio_files[i];
+        }
+    }
+    return NULL;
+}
+
+static int read_ogg_vorbis(const char *filename, short **samples_out, int *sample_count_out, int *sample_rate_out, int *channels_out) {
+    OggVorbis_File vf;
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        return -1;
+    }
+
+    if (ov_open(file, &vf, NULL, 0) < 0) {
+        fclose(file);
+        return -1;
+    }
+
+    vorbis_info *vi = ov_info(&vf, -1);
+    if (!vi) {
+        ov_clear(&vf);
+        return -1;
+    }
+
+    ogg_int64_t pcm_total = ov_pcm_total(&vf, -1);
+    if (pcm_total < 0 || pcm_total > MAX_AUDIO_SAMPLES) {
+        ov_clear(&vf);
+        return -1;
+    }
+
+    int channels = vi->channels;
+    int sample_rate = vi->rate;
+    int sample_count = (int)pcm_total;
+    short *samples = malloc(sample_count * channels * sizeof(short));
+    if (!samples) {
+        ov_clear(&vf);
+        return -1;
+    }
+
+    ogg_int64_t samples_read = 0;
+    int current_section = 0;
+    char buffer[4096];
+
+    while (samples_read < pcm_total) {
+        long bytes_read = ov_read(&vf, buffer, sizeof(buffer), 0, 2, 1, &current_section);
+        if (bytes_read < 0) {
+            free(samples);
+            ov_clear(&vf);
+            return -1;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+
+        int samples_in_chunk = bytes_read / (2 * channels);
+        short *dest = samples + samples_read * channels;
+        short *src = (short *)buffer;
+        for (int i = 0; i < samples_in_chunk * channels; i++) {
+            dest[i] = src[i];
+        }
+        samples_read += samples_in_chunk;
+    }
+
+    ov_clear(&vf);
+
+    *samples_out = samples;
+    *sample_count_out = sample_count;
+    *sample_rate_out = sample_rate;
+    *channels_out = channels;
+
+    return 0;
+}
+
+static ALuint create_buffer_from_ogg_segment(const char *filename, int start_ms, int duration_ms) {
+    cached_audio_file_t *cached = get_cached_audio_file(filename);
+
+    if (!cached && cached_audio_count < MAX_CACHED_FILES) {
+        cached = &cached_audio_files[cached_audio_count++];
+        snprintf(cached->filename, sizeof(cached->filename), "%s", filename);
+        cached->samples = NULL;
+        cached->sample_count = 0;
+        cached->ref_count = 1;
+
+        if (read_ogg_vorbis(filename, &cached->samples, &cached->sample_count, &cached->sample_rate, &cached->channels) < 0) {
+            printd("Failed to decode OGG file: %s", filename);
+            return 0;
+        }
+    }
+
+    if (!cached || !cached->samples) {
+        return 0;
+    }
+
+    int start_sample = (int64_t)start_ms * cached->sample_rate / 1000;
+    int duration_sample = (int64_t)duration_ms * cached->sample_rate / 1000;
+
+    if (start_sample >= cached->sample_count) {
+        return 0;
+    }
+
+    if (start_sample + duration_sample > cached->sample_count) {
+        duration_sample = cached->sample_count - start_sample;
+    }
+
+    int segment_samples = duration_sample * cached->channels;
+    short *segment_data = malloc(segment_samples * sizeof(short));
+    if (!segment_data) {
+        return 0;
+    }
+
+    memcpy(segment_data, cached->samples + start_sample * cached->channels, segment_samples * sizeof(short));
+
+    ALuint buffer = 0;
+    alGenBuffers(1, &buffer);
+    ALenum format = (cached->channels == 2) ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
+    alBufferData(buffer, format, segment_data, segment_samples * sizeof(short), cached->sample_rate);
+
+    free(segment_data);
+
+    return buffer;
 }
 
 static const char short_opts[] = "d:fg:hlm:Mp:s:cuvw:";
@@ -198,8 +524,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "Error: wav directory path too long\n");
 			return EXIT_FAILURE;
 		}
-		strncpy(opt_path_audio, opt_wav_dir, sizeof(opt_path_audio) - 1);
-		opt_path_audio[sizeof(opt_path_audio) - 1] = '\0';
+		snprintf(opt_path_audio, sizeof(opt_path_audio), "%s", opt_wav_dir);
 	}
 
 	if(opt_verbose) {
@@ -243,91 +568,13 @@ int main(int argc, char **argv)
 
 out:
 	cleanup_json_cache();
+	cleanup_audio_cache();
 	device = alcGetContextsDevice(context);
 	alcMakeContextCurrent(NULL);
 	if(context) alcDestroyContext(context);
 	if(device) alcCloseDevice(device);
 
 	return rv;
-}
-
-static char* get_audio_file_from_config(int code) {
-	if (!config_json_cache) {
-		char config_path[PATH_MAX];
-		int result = snprintf(config_path, sizeof(config_path), "%s/config.json", opt_path_audio);
-		if (result < 0 || result >= sizeof(config_path)) {
-			return NULL;
-		}
-
-		FILE *file = fopen(config_path, "r");
-		if (!file) {
-			return NULL;
-		}
-
-		fseek(file, 0, SEEK_END);
-		long file_size = ftell(file);
-		fseek(file, 0, SEEK_SET);
-
-		if (file_size <= 0) {
-			fclose(file);
-			return NULL;
-		}
-
-		char *json_content = malloc(file_size + 1);
-		if (!json_content) {
-			fclose(file);
-			return NULL;
-		}
-
-		size_t bytes_read = fread(json_content, 1, file_size, file);
-		fclose(file);
-
-		if (bytes_read != (size_t)file_size) {
-			free(json_content);
-			return NULL;
-		}
-
-		json_content[file_size] = '\0';
-		config_json_cache = json_parse(json_content, file_size);
-		free(json_content);
-
-		if (!config_json_cache) {
-			return NULL;
-		}
-	}
-
-	struct json_object_s *root = json_value_as_object(config_json_cache);
-	if (!root) return NULL;
-
-	struct json_object_element_s *defines_elem = root->start;
-	while (defines_elem) {
-		if (strcmp(defines_elem->name->string, "defines") == 0) {
-			struct json_object_s *defines_obj = json_value_as_object(defines_elem->value);
-			if (!defines_obj) return NULL;
-
-			char code_str[32];
-			snprintf(code_str, sizeof(code_str), "%d", code);
-
-			struct json_object_element_s *elem = defines_obj->start;
-			while (elem) {
-				if (strcmp(elem->name->string, code_str) == 0) {
-					struct json_string_s *value_str = json_value_as_string(elem->value);
-					if (value_str) {
-						char *result = malloc(value_str->string_size + 1);
-						if (result) {
-							strcpy(result, value_str->string);
-							return result;
-						}
-					}
-				}
-				elem = elem->next;
-			}
-			break;
-		}
-		defines_elem = defines_elem->next;
-	}
-
-	return NULL;
 }
 
 static void usage(char *exe)
@@ -568,11 +815,15 @@ int play(int code, int press)
 	static ALuint src[512] = { 0 };
 
 	int idx = code + press * 256;
-	char *custom_name = NULL;
 
 	if(src[idx] == 0) {
 		char fname[PATH_MAX];
-		custom_name = get_audio_file_from_config(code);
+		int start_ms = 0, duration_ms = 0;
+		ALuint buffer = 0;
+
+		char *custom_name = get_audio_file_from_config(code);
+		printd("custom_name=%s config_key_define_type_single=%d", custom_name, config_key_define_type_single);
+
 		if (custom_name) {
 			int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, custom_name);
 			if (result < 0 || result >= sizeof(fname)) {
@@ -580,20 +831,40 @@ int play(int code, int press)
 				src[idx] = SRC_INVALID;
 				return -1;
 			}
+
+			printd("Loading audio file \"%s\"", fname);
+
+			buffer = alureCreateBufferFromFile(fname);
 		} else {
-			char *name = map_code_to_name(code);
-			int result = snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
-			if (result < 0 || result >= sizeof(fname)) {
-				src[idx] = SRC_INVALID;
-				return -1;
+			int has_segment = get_audio_segment_from_config(code, &start_ms, &duration_ms);
+			printd("has_segment=%d start_ms=%d duration_ms=%d config_main_sound_file=%s", 
+			       has_segment, start_ms, duration_ms, config_main_sound_file);
+
+			if (has_segment && config_main_sound_file) {
+				int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, config_main_sound_file);
+				if (result < 0 || result >= sizeof(fname)) {
+					src[idx] = SRC_INVALID;
+					return -1;
+				}
+
+				printd("Loading OGG segment from \"%s\" start=%dms duration=%dms", fname, start_ms, duration_ms);
+
+				buffer = create_buffer_from_ogg_segment(fname, start_ms, duration_ms);
+			} else {
+				char *name = map_code_to_name(code);
+				int result = snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
+				if (result < 0 || result >= sizeof(fname)) {
+					src[idx] = SRC_INVALID;
+					return -1;
+				}
+
+				printd("Loading audio file \"%s\"", fname);
+
+				buffer = alureCreateBufferFromFile(fname);
 			}
 		}
 
-		printd("Loading audio file \"%s\"", fname);
-
-		buf[idx] = alureCreateBufferFromFile(fname);
-		if(buf[idx] == 0) {
-
+		if (buffer == 0) {
 			if(opt_fallback_sound) {
 				int result = snprintf(fname, sizeof(fname), "%s/fallback.wav", opt_path_audio);
 				if (result < 0 || result >= sizeof(fname)) {
@@ -601,15 +872,19 @@ int play(int code, int press)
 					return -1;
 				}
 				buf[idx] = alureCreateBufferFromFile(fname);
-			} else {
+			} else if (custom_name) {
 				fprintf(stderr, "Error opening audio file \"%s\": %s\n", fname, alureGetErrorString());
 			}
 
-			if(buf[idx] == 0) {
+			if (buffer == 0 && !opt_fallback_sound) {
 				src[idx] = SRC_INVALID;
+				if (custom_name) free(custom_name);
 				return -1;
 			}
 		}
+
+		buf[idx] = buffer;
+		free(custom_name);
 	
 		alGenSources((ALuint)1, &src[idx]);
 		TEST_ERROR("source generation");
@@ -631,7 +906,6 @@ int play(int code, int press)
 		TEST_ERROR("source playing");
 	}
 
-	if (custom_name) free(custom_name);
 	return 0;
 }
 
