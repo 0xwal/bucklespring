@@ -1,6 +1,6 @@
 
 NAME   	:= buckle
-SRC 	:= main.c
+SRC 	:= main.c deps/minivorbis.c
 VERSION	:= 1.5.1
 ifeq ($(OS),Windows_NT)
 CC := i686-w64-mingw32-gcc
@@ -10,6 +10,7 @@ PATH_AUDIO ?= "./wav"
 CFLAGS	?= -O3 -g
 LDFLAGS ?= -g
 CFLAGS  += -Wall -Werror 
+CFLAGS  += -I.
 CFLAGS  += -DVERSION=\"$(VERSION)\"
 CFLAGS  += -DPATH_AUDIO=\"$(PATH_AUDIO)\"
 

@@ -12,15 +12,8 @@
 #include <time.h>
 #include <sys/stat.h>
 
-#define OGG_IMPL
-#define VORBIS_IMPL
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmisleading-indentation"
-#pragma GCC diagnostic ignored "-Wunused-variable"
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#pragma GCC diagnostic ignored "-Wstringop-truncation"
-#include "minivorbis.h"
-#pragma GCC diagnostic pop
+#define OV_EXCLUDE_STATIC_CALLBACKS
+#include "deps/minivorbis.h"
 
 #ifdef __APPLE__
 #include <OpenAL/al.h>
@@ -32,7 +25,7 @@
 #endif
 
 #include "buckle.h"
-#include "json.h"
+#include "deps/json.h"
 
  #define SRC_INVALID INT_MAX
  #define DEFAULT_MUTE_KEYCODE 0x46
