@@ -326,6 +326,70 @@ static int get_audio_segment_from_config(int code, int *start_ms, int *duration_
     return 0;
 }
 
+static int get_random_fallback_segment(int *start_ms, int *duration_ms) {
+    parse_config_json();
+
+    if (!config_key_define_type_single || !config_json_cache) {
+        return 0;
+    }
+
+    struct json_object_s *root = json_value_as_object(config_json_cache);
+    if (!root) return 0;
+
+    struct json_object_element_s *defines_elem = root->start;
+    while (defines_elem) {
+        if (strcmp(defines_elem->name->string, "defines") == 0) {
+            struct json_object_s *defines_obj = json_value_as_object(defines_elem->value);
+            if (!defines_obj) return 0;
+
+            int keycodes[256];
+            int count = 0;
+
+            struct json_object_element_s *code_elem = defines_obj->start;
+            while (code_elem && count < 256) {
+                struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
+                if (segment_arr && segment_arr->length >= 2) {
+                    keycodes[count++] = atoi(code_elem->name->string);
+                }
+                code_elem = code_elem->next;
+            }
+
+            if (count > 0) {
+                int random_idx = rand() % count;
+                int random_code = keycodes[random_idx];
+
+                code_elem = defines_obj->start;
+                while (code_elem) {
+                    if (atoi(code_elem->name->string) == random_code) {
+                        struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
+                        if (segment_arr && segment_arr->length >= 2) {
+                            struct json_array_element_s *start_elem = segment_arr->start;
+                            struct json_array_element_s *duration_elem = start_elem->next;
+
+                            if (start_elem && duration_elem) {
+                                struct json_number_s *start_num = json_value_as_number(start_elem->value);
+                                struct json_number_s *duration_num = json_value_as_number(duration_elem->value);
+                                if (start_num && duration_num) {
+                                    *start_ms = (int)strtod(start_num->number, NULL);
+                                    *duration_ms = (int)strtod(duration_num->number, NULL);
+                                    printd("fallback: using random keycode %d (start=%d, duration=%d)", random_code, *start_ms, *duration_ms);
+                                    return 1;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    code_elem = code_elem->next;
+                }
+            }
+            break;
+        }
+        defines_elem = defines_elem->next;
+    }
+
+    return 0;
+}
+
 static cached_audio_file_t* get_cached_audio_file(const char *filename) {
     int i;
     for (i = 0; i < cached_audio_count; i++) {
@@ -923,29 +987,34 @@ int play(int code, int press)
 
 			buffer = alureCreateBufferFromFile(fname);
 		} else {
-			int has_segment = get_audio_segment_from_config(code, &start_ms, &duration_ms);
-			printd("has_segment=%d start_ms=%d duration_ms=%d config_main_sound_file=%s", 
-			       has_segment, start_ms, duration_ms, config_main_sound_file);
+  			int has_segment = get_audio_segment_from_config(code, &start_ms, &duration_ms);
+			printd("has_segment=%d start_ms=%d duration_ms=%d config_main_sound_file=%s",
+			       has_segment, start_ms, duration_ms, config_main_sound_file ? config_main_sound_file : "(null)");
 
- 			if (has_segment && config_main_sound_file) {
- 				int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, config_main_sound_file);
- 				if (result < 0 || result >= sizeof(fname)) {
- 					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
- 					src[idx] = SRC_INVALID;
- 					return -1;
- 				}
+			if (config_key_define_type_single && !has_segment) {
+				has_segment = get_random_fallback_segment(&start_ms, &duration_ms);
+				printd("fallback_segment=%d start_ms=%d duration_ms=%d", has_segment, start_ms, duration_ms);
+			}
+
+  			if (has_segment && config_main_sound_file) {
+  				int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, config_main_sound_file);
+  				if (result < 0 || result >= sizeof(fname)) {
+  					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
+  					src[idx] = SRC_INVALID;
+  					return -1;
+  				}
 
 				printd("Loading OGG segment from \"%s\" start=%dms duration=%dms", fname, start_ms, duration_ms);
 
 				buffer = create_buffer_from_ogg_segment(fname, start_ms, duration_ms);
- 			} else {
- 				char *name = map_code_to_name(code);
- 				int result = snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
- 				if (result < 0 || result >= sizeof(fname)) {
- 					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
- 					src[idx] = SRC_INVALID;
- 					return -1;
- 				}
+  			} else {
+				char *name = map_code_to_name(code);
+				int result = snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
+				if (result < 0 || result >= sizeof(fname)) {
+					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
+					src[idx] = SRC_INVALID;
+					return -1;
+				}
 
 				printd("Loading audio file \"%s\"", fname);
 
