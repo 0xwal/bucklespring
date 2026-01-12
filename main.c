@@ -957,10 +957,11 @@ int play(int code, int press)
 
   	int idx = code + press * MAX_KEYCODES;
 
-	if(src[idx] == 0) {
-		char fname[PATH_MAX];
-		int start_ms = 0, duration_ms = 0;
-		ALuint buffer = 0;
+   	if(src[idx] == 0) {
+ 		char fname[PATH_MAX];
+ 		int start_ms = 0, duration_ms = 0;
+ 		ALuint buffer = 0;
+ 		ALenum error;
 
 		char *custom_name = get_audio_file_from_config(code);
 		printd("custom_name=%s config_key_define_type_single=%d", custom_name, config_key_define_type_single);
@@ -1015,7 +1016,7 @@ int play(int code, int press)
 					src[idx] = SRC_INVALID;
 					return -1;
 				}
-				buf[idx] = alureCreateBufferFromFile(fname);
+				buffer = alureCreateBufferFromFile(fname);
 			} else if (custom_name) {
 				fprintf(stderr, "Error opening audio file \"%s\": %s\n", fname, alureGetErrorString());
 			}
@@ -1027,18 +1028,18 @@ int play(int code, int press)
 			}
 		}
 
- 		alGenSources((ALuint)1, &src[idx]);
- 		ALenum error = alGetError();
- 		if (error != AL_NO_ERROR) {
- 			alDeleteBuffers(1, &buffer);
- 			free(custom_name);
- 			src[idx] = SRC_INVALID;
- 			fprintf(stderr, "source generation failed\n");
- 			return -1;
- 		}
+		alGenSources((ALuint)1, &src[idx]);
+		error = alGetError();
+		if (error != AL_NO_ERROR) {
+			alDeleteBuffers(1, &buffer);
+			free(custom_name);
+			src[idx] = SRC_INVALID;
+			fprintf(stderr, "source generation failed\n");
+			return -1;
+		}
 
- 		buf[idx] = buffer;
- 		free(custom_name);
+		buf[idx] = buffer;
+		free(custom_name);
 
 		double x = find_key_loc(code);
 		if (opt_stereo_width > 0) {
