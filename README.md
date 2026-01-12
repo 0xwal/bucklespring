@@ -1,9 +1,9 @@
 Nostalgia bucklespring keyboard sound
-=====================================
+====================================
 
 Copyright 2016 Ico Doornekamp
 
-Fork with additional features: custom sound pack support and press-only mode.
+Fork with additional features: custom sound pack support (MechVibes-compatible), press-only mode, OGG segment extraction, and sound pack loading.
 
 This project emulates the sound of my old faithful IBM Model-M space saver
 bucklespring keyboard while typing on my notebook, mainly for the purpose of
@@ -142,57 +142,193 @@ usage: ./buckle [options]
 
 options:
 
-  -d DEVICE use OpenAL audio device DEVICE
-  -f        use a fallback sound for unknown keys
-  -g GAIN   set playback gain [0..100]
-  -m CODE   use CODE as mute key (default 0x46 for scroll lock)
-  -M        start the program muted
-  -h        show help
-  -l        list available openAL audio devices
-  -p PATH   load .wav files from directory PATH
-  -s WIDTH  set stereo width [0..100]
-  -u        don't play sound on key release (press-only mode)
-  -v        increase verbosity / debugging
+  -d, --device=DEVICE       use OpenAL audio device DEVICE
+  -f, --fallback-sound      use a fallback sound for unknown keys
+  -g, --gain=GAIN           set playback gain [0..100]
+  -m, --mute-keycode=CODE   use CODE as mute key (default 0x46 for scroll lock)
+  -M, --mute                start the program muted
+  -c, --no-click            don't play a sound on mouse click
+  -p, --pack=NAME           load sound pack NAME from wav directory
+  -u, --press-only          don't play sound on key release (press-only mode)
+  -h, --help                show help
+  -l, --list-devices        list available OpenAL audio devices
+  -s, --stereo-width=WIDTH  set stereo width [0..100]
+  -v, --verbose             increase verbosity / debugging
+  -w, --wav-dir=DIR         set base wav directory (default ./wav)
 ````
 
-## Custom Sound Packs
+## Custom Sound Packs and MechVibes Compatibility
 
-Bucklespring now supports **Mechvibes-compatible** sound pack configurations through a `config.json` file in the audio directory. This allows you to use sound packs designed for Mechvibes and other keyboard sound simulators by mapping specific key codes to custom audio files.
+This fork extends bucklespring with comprehensive **MechVibes-compatible sound pack support**. You can now use sound packs designed for MechVibes by placing a `config.json` file in your audio directory.
 
-### Config.json Format
+### Features Added in This Fork
 
-Create a `config.json` file in your audio directory with the following structure:
+- **MechVibes config.json support** - Load packs with JSON configuration
+- **Two audio modes** - Multi-file (individual WAVs) and Single-file (OGG with segments)
+- **OGG segment extraction** - Extract key sounds from a single OGG file using `[start_ms, duration_ms]` timing
+- **Sound pack loading** - Use `-p/--pack` to load packs from subdirectories
+- **Random fallback segments** - Undefined keys randomly pick from defined segments
+- **Fallback WAV support** - `fallback.wav` for missing keys with `-f` flag
+
+### Audio Modes
+
+#### Multi-File Mode (Individual WAV Files)
+
+In this mode, each key has its own audio file. Use `key_define_type: "multi"` in config.json:
 
 ```json
 {
-    "id": "custom-sound-pack-123",
-    "name": "My Custom Keyboard Sounds",
+    "key_define_type": "multi",
     "defines": {
-        "1": "custom-key1.wav",
-        "14": "custom-backspace.wav",
-        "29": "custom-ctrl.wav"
+        "1": "key-1.wav",
+        "2": "key-2.wav",
+        "30": "key-a.wav"
     }
 }
 ```
 
-The `defines` object maps key codes (as strings) to audio filenames. When a key with the specified code is pressed, bucklespring will use the custom audio file instead of the default naming scheme.
+#### Single-File Mode (OGG with Segments)
 
-### Mechvibes Compatibility
+In this mode, all key sounds come from a single OGG file using time segments. Use `key_define_type: "single"`:
 
-This feature is specifically designed to work with **Mechvibes sound packs**. Simply place the `config.json` file from any Mechvibes sound pack in your audio directory, and bucklespring will automatically use the custom key mappings.
+```json
+{
+    "key_define_type": "single",
+    "sound": "keyboard.ogg",
+    "defines": {
+        "1": [971, 142],
+        "2": [1276, 115],
+        "30": [11171, 109]
+    }
+}
+```
 
-The audio files should be in standard WAV format (16-bit PCM, 44.1kHz, mono) as used by Mechvibes.
+The segment format `[start_ms, duration_ms]` specifies where in the OGG file to extract each key's sound.
 
-Mechvibes sound packs can be found on various keyboard enthusiast communities and GitHub repositories.
+### Config.json Format
 
-## Additional Options
+Create a `config.json` file in your audio directory:
+
+```json
+{
+    "id": "sound-pack-123",
+    "name": "My Sound Pack",
+    "key_define_type": "single",
+    "sound": "main.ogg",
+    "defines": {
+        "1": [971, 142],
+        "2": [1276, 115],
+        "30": [11171, 109],
+        "31": [11462, 120]
+    }
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `key_define_type` | Yes | `"single"` for OGG segments, `"multi"` for individual files |
+| `sound` | Yes (single mode) | Main audio filename (OGG format) |
+| `defines` | Yes | Keycode mappings to filenames or `[start_ms, duration_ms]` arrays |
+
+### Loading Sound Packs
+
+Organize sound packs in subdirectories under your audio directory:
+
+```
+wav/
+├── oreo/
+│   ├── config.json
+│   └── oreo.ogg
+├── banana1/
+│   ├── config.json
+│   ├── banana-l-1.wav
+│   └── ...
+└── my-pack/
+    └── ...
+```
+
+Load a pack using the `-p` option:
+
+```bash
+# Load "oreo" pack from wav/oreo/
+./buckle -p oreo
+
+# Load pack with custom audio directory
+./buckle -w /path/to/packs -p my-pack
+
+# Verbose mode to see config loading
+./buckle -v -p oreo
+```
+
+### MechVibes Compatibility
+
+This feature is designed to work with **MechVibes sound packs**. Many community-created packs include a `config.json` file that can be used directly with this fork.
+
+Example MechVibes pack structure:
+```
+my-pack/
+├── config.json
+├── main.ogg
+└── ...audio files
+```
+
+### Fallback Sound
+
+If a key has no defined sound, bucklespring will:
+
+1. **Single-file mode**: Randomly pick a segment from another defined key
+2. **Multi-file mode / with -f flag**: Use `fallback.wav` if it exists
+3. **Otherwise**: Play nothing
+
+Use the `-f` flag to enable fallback.wav for missing keys:
+
+```bash
+./buckle -f
+```
+
+### Directory Structure
+
+```
+bucklespring/
+├── buckle              # Compiled binary
+├── wav/                # Audio files directory
+│   ├── config.json     # Root config (optional)
+│   ├── fallback.wav    # Fallback for missing keys
+│   ├── *.wav           # Individual key sounds
+│   ├── pack1/          # Sound pack 1
+│   │   ├── config.json
+│   │   └── ...
+│   └── pack2/          # Sound pack 2
+│       ├── config.json
+│       └── ...
+└── deps/
+    ├── minivorbis.c    # OGG decoder
+    └── json.h          # JSON parser
+```
+
+### Keycodes
+
+Keycodes use the Linux input subsystem standard. Common codes:
+
+| Code | Key |
+|------|-----|
+| 1 | ESC |
+| 2-13 | F1-F12 |
+| 14 | Backspace |
+| 15 | Tab |
+| 16-28 | Q-P |
+| 29-42 | A-L |
+| 43-53 | Z-M |
+| 57 | Space |
+| 58 | Caps Lock |
+| 59-68 | F1-F10 (alternate) |
 
 ### Press-Only Mode
 
-The `--press-only` (`-u`) option disables audio playback for key release events, playing sounds only when keys are pressed down. This can create a different typing experience and reduce audio clutter.
+The `--press-only` (`-u`) option disables audio playback for key release events, playing sounds only when keys are pressed down:
 
-```
-$ ./buckle --press-only
+```bash
+./buckle --press-only
 ```
 
 OpenAL notes
