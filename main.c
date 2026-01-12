@@ -34,11 +34,13 @@
 #include "buckle.h"
 #include "json.h"
 
-#define SRC_INVALID INT_MAX
-#define DEFAULT_MUTE_KEYCODE 0x46 /* Scroll Lock */
+ #define SRC_INVALID INT_MAX
+ #define DEFAULT_MUTE_KEYCODE 0x46 /* Scroll Lock */
 
-#define MAX_CACHED_FILES 16
-#define MAX_AUDIO_SAMPLES 4 * 48000 * 60
+ #define MAX_CACHED_FILES 16
+ #define MAX_AUDIO_SAMPLES 4 * 48000 * 60
+ #define MAX_KEYCODES 256
+ #define MAX_AUDIO_SOURCES (MAX_KEYCODES * 2)
 
 typedef struct {
     char filename[PATH_MAX];
@@ -49,12 +51,13 @@ typedef struct {
     int ref_count;
 } cached_audio_file_t;
 
-#define TEST_ERROR(_msg)		\
-	error = alGetError();		\
-	if (error != AL_NO_ERROR) {	\
-		fprintf(stderr, _msg "\n");	\
-		exit(1);		\
-	}
+ #define TEST_ERROR(_msg)		\
+ 	error = alGetError();		\
+ 	if (error != AL_NO_ERROR) {	\
+ 		fprintf(stderr, _msg "\n");	\
+ 		rv = EXIT_FAILURE;		\
+ 		goto out;			\
+ 	}
 
 
 static void usage(char *exe);
@@ -146,11 +149,15 @@ static void parse_config_json(void) {
     char config_path[PATH_MAX];
     int result = snprintf(config_path, sizeof(config_path), "%s/config.json", opt_path_audio);
     if (result < 0 || result >= sizeof(config_path)) {
+        printd("config: path too long");
         return;
     }
 
+    printd("config: loading \"%s\"", config_path);
+
     FILE *file = fopen(config_path, "r");
     if (!file) {
+        printd("config: failed to open: %s", strerror(errno));
         return;
     }
 
@@ -158,13 +165,23 @@ static void parse_config_json(void) {
     long file_size = ftell(file);
     fseek(file, 0, SEEK_SET);
 
-    if (file_size <= 0) {
+    printd("config: file_size=%ld", file_size);
+
+    if (file_size <= 0 || file_size > 1024 * 1024) {
+        printd("config: file_size check failed (%ld)", file_size);
         fclose(file);
         return;
     }
 
-    char *json_content = malloc(file_size + 1);
+    if ((size_t)file_size > SIZE_MAX - 1) {
+        printd("config: file_size too large for SIZE_MAX");
+        fclose(file);
+        return;
+    }
+
+    char *json_content = malloc((size_t)file_size + 1);
     if (!json_content) {
+        printd("config: malloc failed");
         fclose(file);
         return;
     }
@@ -172,7 +189,10 @@ static void parse_config_json(void) {
     size_t bytes_read = fread(json_content, 1, file_size, file);
     fclose(file);
 
+    printd("config: bytes_read=%zu expected=%ld", bytes_read, file_size);
+
     if (bytes_read != (size_t)file_size) {
+        printd("config: incomplete read");
         free(json_content);
         return;
     }
@@ -181,28 +201,42 @@ static void parse_config_json(void) {
     config_json_cache = json_parse(json_content, file_size);
     free(json_content);
 
+    printd("config: json_parse result=%p", (void*)config_json_cache);
+
     if (!config_json_cache) {
+        printd("config: JSON parsing failed");
         return;
     }
 
+    printd("config: parsing JSON...");
+
     struct json_object_s *root = json_value_as_object(config_json_cache);
-    if (!root) return;
+    if (!root) {
+        printd("config: root is not an object");
+        return;
+    }
 
     struct json_object_element_s *elem = root->start;
     while (elem) {
         if (strcmp(elem->name->string, "key_define_type") == 0) {
             struct json_string_s *type_str = json_value_as_string(elem->value);
-            if (type_str && strcmp(type_str->string, "single") == 0) {
-                config_key_define_type_single = 1;
+            if (type_str) {
+                printd("config: key_define_type = \"%s\"", type_str->string);
+                if (strcmp(type_str->string, "single") == 0) {
+                    config_key_define_type_single = 1;
+                }
             }
         } else if (strcmp(elem->name->string, "sound") == 0) {
             struct json_string_s *sound_str = json_value_as_string(elem->value);
             if (sound_str) {
+                printd("config: sound = \"%s\"", sound_str->string);
                 config_main_sound_file = strdup(sound_str->string);
             }
         }
         elem = elem->next;
     }
+
+    printd("config: key_define_type_single=%d main_sound=%s", config_key_define_type_single, config_main_sound_file ? config_main_sound_file : "(null)");
 }
 
 static char* get_audio_file_from_config(int code) {
@@ -226,11 +260,12 @@ static char* get_audio_file_from_config(int code) {
                 if (strcmp(elem->name->string, code_str) == 0) {
                     struct json_string_s *value_str = json_value_as_string(elem->value);
                     if (value_str) {
-                        char *result = malloc(value_str->string_size + 1);
-                        if (result) {
-                            strcpy(result, value_str->string);
-                            return result;
-                        }
+                         char *result = malloc(value_str->string_size + 1);
+                         if (result) {
+                             strncpy(result, value_str->string, value_str->string_size);
+                             result[value_str->string_size] = '\0';
+                             return result;
+                         }
                     }
                 }
                 elem = elem->next;
@@ -329,7 +364,13 @@ static int read_ogg_vorbis(const char *filename, short **samples_out, int *sampl
     int channels = vi->channels;
     int sample_rate = vi->rate;
     int sample_count = (int)pcm_total;
-    short *samples = malloc(sample_count * channels * sizeof(short));
+    size_t total_samples = (size_t)sample_count * (size_t)channels;
+    if (sample_count > 0 && channels > 0 && total_samples > SIZE_MAX / sizeof(short)) {
+        ov_clear(&vf);
+        return -1;
+    }
+
+    short *samples = malloc(total_samples * sizeof(short));
     if (!samples) {
         ov_clear(&vf);
         return -1;
@@ -400,13 +441,26 @@ static ALuint create_buffer_from_ogg_segment(const char *filename, int start_ms,
         duration_sample = cached->sample_count - start_sample;
     }
 
-    int segment_samples = duration_sample * cached->channels;
+    size_t segment_samples = (size_t)duration_sample * (size_t)cached->channels;
+    if (duration_sample > 0 && cached->channels > 0 && segment_samples > SIZE_MAX / sizeof(short)) {
+        return 0;
+    }
     short *segment_data = malloc(segment_samples * sizeof(short));
     if (!segment_data) {
         return 0;
     }
 
-    memcpy(segment_data, cached->samples + start_sample * cached->channels, segment_samples * sizeof(short));
+    size_t start_offset = (size_t)start_sample * (size_t)cached->channels;
+    size_t total_cached_samples = (size_t)cached->sample_count * (size_t)cached->channels;
+    size_t segment_bytes = segment_samples * sizeof(short);
+
+    if (start_offset > total_cached_samples || 
+        start_offset + segment_samples > total_cached_samples) {
+        free(segment_data);
+        return 0;
+    }
+
+    memcpy(segment_data, cached->samples + start_offset, segment_bytes);
 
     ALuint buffer = 0;
     alGenBuffers(1, &buffer);
@@ -454,30 +508,52 @@ int main(int argc, char **argv)
 			case 'f':
 				opt_fallback_sound = 1;
 				break;
-			case 'g':
-				opt_gain = atoi(optarg);
-				break;
-			case 'h':
-				usage(argv[0]);
-				return 0;
-			case 'l':
-				list_devices();
-				return 0;
-			case 'm':
-				opt_mute_keycode = strtol(optarg, NULL, 0);
-				break;
-			case 'M':
-				muted = !muted;
-				break;
-			case 'p':
-				opt_pack_name = optarg;
-				break;
-			case 'w':
-				opt_wav_dir = optarg;
-				break;
-			case 's':
-				opt_stereo_width = atoi(optarg);
-				break;
+ 			case 'g': {
+ 				int gain = atoi(optarg);
+ 				if (gain < 0 || gain > 100) {
+ 					fprintf(stderr, "Error: gain must be between 0 and 100\n");
+ 					return EXIT_FAILURE;
+ 				}
+ 				opt_gain = gain;
+ 				break;
+ 			}
+ 			case 'm': {
+ 				long keycode = strtol(optarg, NULL, 0);
+ 				if (keycode < 0 || keycode > 255) {
+ 					fprintf(stderr, "Error: keycode must be between 0 and 255\n");
+ 					return EXIT_FAILURE;
+ 				}
+ 				opt_mute_keycode = (int)keycode;
+ 				break;
+ 			}
+ 			case 's': {
+ 				int width = atoi(optarg);
+ 				if (width < 0 || width > 100) {
+ 					fprintf(stderr, "Error: stereo width must be between 0 and 100\n");
+ 					return EXIT_FAILURE;
+ 				}
+ 				opt_stereo_width = width;
+ 				break;
+ 			}
+ 			case 'h':
+ 				usage(argv[0]);
+ 				return 0;
+ 			case 'l':
+ 				list_devices();
+ 				return 0;
+ 			case 'M':
+ 				muted = !muted;
+ 				break;
+  			case 'p':
+  				if (strstr(optarg, "..") != NULL || optarg[0] == '/') {
+  					fprintf(stderr, "Error: pack name contains invalid characters\n");
+  					return EXIT_FAILURE;
+  				}
+  				opt_pack_name = optarg;
+  				break;
+ 			case 'w':
+ 				opt_wav_dir = optarg;
+ 				break;
 			case 'c':
 				opt_no_click++;
 				break;
@@ -496,10 +572,14 @@ int main(int argc, char **argv)
 
 	/* Path to data files can also be specified by environment, this is
 	 * used by the snap package */
-	const char *env_path = getenv("BUCKLESPRING_WAV_DIR");
-	if (env_path) {
-		opt_wav_dir = env_path;
-	}
+ 	const char *env_path = getenv("BUCKLESPRING_WAV_DIR");
+ 	if (env_path) {
+ 		if (strlen(env_path) > PATH_MAX - 32) {
+ 			fprintf(stderr, "Error: BUCKLESPRING_WAV_DIR path too long\n");
+ 			return EXIT_FAILURE;
+ 		}
+ 		opt_wav_dir = env_path;
+ 	}
 
 	/* Validate wav directory exists */
 	struct stat st;
@@ -551,12 +631,13 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
-	context = alcCreateContext(device, NULL);
-	if (!alcMakeContextCurrent(context)) {
-		fprintf(stderr, "failed to make default context\n");
-		return -1;
-	}
-	TEST_ERROR("make default context");
+ 	context = alcCreateContext(device, NULL);
+ 	if (!alcMakeContextCurrent(context)) {
+ 		fprintf(stderr, "failed to make default context\n");
+ 		rv = EXIT_FAILURE;
+ 		goto out;
+ 	}
+ 	TEST_ERROR("make default context");
 
 	alListener3f(AL_POSITION, 0, 0, 0);
 	alListener3f(AL_VELOCITY, 0, 0, 0);
@@ -807,14 +888,19 @@ int play(int code, int press)
 
 	/* Check for mute sequence: ScrollLock down+up+down */
 
-	if (press) {
-		handle_mute_key(code == opt_mute_keycode);
-	}
+ 	if (press) {
+ 		handle_mute_key(code == opt_mute_keycode);
+ 	}
 
-	static ALuint buf[512] = { 0 };
-	static ALuint src[512] = { 0 };
+	if (code < 0 || code > 255) {
+ 		fprintf(stderr, "Warning: keycode %d out of valid range 0-255, ignoring\n", code);
+ 		return -1;
+ 	}
 
-	int idx = code + press * 256;
+  	static ALuint buf[MAX_AUDIO_SOURCES] = { 0 };
+  	static ALuint src[MAX_AUDIO_SOURCES] = { 0 };
+
+  	int idx = code + press * MAX_KEYCODES;
 
 	if(src[idx] == 0) {
 		char fname[PATH_MAX];
@@ -824,13 +910,14 @@ int play(int code, int press)
 		char *custom_name = get_audio_file_from_config(code);
 		printd("custom_name=%s config_key_define_type_single=%d", custom_name, config_key_define_type_single);
 
-		if (custom_name) {
-			int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, custom_name);
-			if (result < 0 || result >= sizeof(fname)) {
-				free(custom_name);
-				src[idx] = SRC_INVALID;
-				return -1;
-			}
+ 		if (custom_name) {
+ 			int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, custom_name);
+ 			if (result < 0 || result >= sizeof(fname)) {
+ 				fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
+ 				free(custom_name);
+ 				src[idx] = SRC_INVALID;
+ 				return -1;
+ 			}
 
 			printd("Loading audio file \"%s\"", fname);
 
@@ -840,23 +927,25 @@ int play(int code, int press)
 			printd("has_segment=%d start_ms=%d duration_ms=%d config_main_sound_file=%s", 
 			       has_segment, start_ms, duration_ms, config_main_sound_file);
 
-			if (has_segment && config_main_sound_file) {
-				int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, config_main_sound_file);
-				if (result < 0 || result >= sizeof(fname)) {
-					src[idx] = SRC_INVALID;
-					return -1;
-				}
+ 			if (has_segment && config_main_sound_file) {
+ 				int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, config_main_sound_file);
+ 				if (result < 0 || result >= sizeof(fname)) {
+ 					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
+ 					src[idx] = SRC_INVALID;
+ 					return -1;
+ 				}
 
 				printd("Loading OGG segment from \"%s\" start=%dms duration=%dms", fname, start_ms, duration_ms);
 
 				buffer = create_buffer_from_ogg_segment(fname, start_ms, duration_ms);
-			} else {
-				char *name = map_code_to_name(code);
-				int result = snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
-				if (result < 0 || result >= sizeof(fname)) {
-					src[idx] = SRC_INVALID;
-					return -1;
-				}
+ 			} else {
+ 				char *name = map_code_to_name(code);
+ 				int result = snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
+ 				if (result < 0 || result >= sizeof(fname)) {
+ 					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
+ 					src[idx] = SRC_INVALID;
+ 					return -1;
+ 				}
 
 				printd("Loading audio file \"%s\"", fname);
 
@@ -864,13 +953,14 @@ int play(int code, int press)
 			}
 		}
 
-		if (buffer == 0) {
-			if(opt_fallback_sound) {
-				int result = snprintf(fname, sizeof(fname), "%s/fallback.wav", opt_path_audio);
-				if (result < 0 || result >= sizeof(fname)) {
-					src[idx] = SRC_INVALID;
-					return -1;
-				}
+ 		if (buffer == 0) {
+ 			if(opt_fallback_sound) {
+ 				int result = snprintf(fname, sizeof(fname), "%s/fallback.wav", opt_path_audio);
+ 				if (result < 0 || result >= sizeof(fname)) {
+ 					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
+ 					src[idx] = SRC_INVALID;
+ 					return -1;
+ 				}
 				buf[idx] = alureCreateBufferFromFile(fname);
 			} else if (custom_name) {
 				fprintf(stderr, "Error opening audio file \"%s\": %s\n", fname, alureGetErrorString());
@@ -883,11 +973,18 @@ int play(int code, int press)
 			}
 		}
 
-		buf[idx] = buffer;
-		free(custom_name);
-	
-		alGenSources((ALuint)1, &src[idx]);
-		TEST_ERROR("source generation");
+ 		alGenSources((ALuint)1, &src[idx]);
+ 		ALenum error = alGetError();
+ 		if (error != AL_NO_ERROR) {
+ 			alDeleteBuffers(1, &buffer);
+ 			free(custom_name);
+ 			src[idx] = SRC_INVALID;
+ 			fprintf(stderr, "source generation failed\n");
+ 			return -1;
+ 		}
+
+ 		buf[idx] = buffer;
+ 		free(custom_name);
 
 		double x = find_key_loc(code);
 		if (opt_stereo_width > 0) {
@@ -895,16 +992,25 @@ int play(int code, int press)
 		}
 		alSourcef(src[idx], AL_GAIN, opt_gain / 100.0);
 
-		alSourcei(src[idx], AL_BUFFER, buf[idx]);
-		TEST_ERROR("buffer binding");
+ 		alSourcei(src[idx], AL_BUFFER, buf[idx]);
+ 		error = alGetError();
+ 		if (error != AL_NO_ERROR) {
+ 			fprintf(stderr, "buffer binding failed\n");
+ 			return -1;
+ 		}
 	}
 
 
-	if(src[idx] != 0 && src[idx] != SRC_INVALID) {
-		if (!muted)
-			alSourcePlay(src[idx]);
-		TEST_ERROR("source playing");
-	}
+ 	if(src[idx] != 0 && src[idx] != SRC_INVALID) {
+ 		if (!muted) {
+ 			alSourcePlay(src[idx]);
+ 			error = alGetError();
+ 			if (error != AL_NO_ERROR) {
+ 				fprintf(stderr, "source playing failed\n");
+ 				return -1;
+ 			}
+ 		}
+ 	}
 
 	return 0;
 }

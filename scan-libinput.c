@@ -10,16 +10,20 @@
 #include "buckle.h"
 
 
-static int open_restricted(const char *path, int flags, void *user_data)
-{
-	int fd = open(path, flags);
-
-	if(fd < 0) {
-		fprintf(stderr, "Failed to open %s (%s)\n", path, strerror(errno));
-	}
-
-	return fd < 0 ? -errno : fd;
-}
+ static int open_restricted(const char *path, int flags, void *user_data)
+ {
+  	if ((flags & O_ACCMODE) == O_WRONLY) {
+  		fprintf(stderr, "Security: write-only access requested: 0x%x\n", flags);
+  		return -EPERM;
+  	}
+ 	int fd = open(path, flags);
+ 
+ 	if(fd < 0) {
+ 		fprintf(stderr, "Failed to open %s (%s)\n", path, strerror(errno));
+ 	}
+ 
+ 	return fd < 0 ? -errno : fd;
+ }
 
 
 static void close_restricted(int fd, void *user_data)
@@ -65,11 +69,11 @@ static void handle_events(struct libinput *li)
 }
 
 
-static void log_handler(struct libinput *li, enum libinput_log_priority priority,
-		const char *format, va_list args)
-{
-	vprintf(format, args);
-}
+ static void log_handler(struct libinput *li, enum libinput_log_priority priority,
+ 		const char *format, va_list args)
+ {
+ 	vfprintf(stderr, format, args);
+ }
 
 
 int scan(int verbose)
@@ -86,6 +90,7 @@ int scan(int verbose)
 	li = libinput_udev_create_context(&interface, NULL, udev);
 	if(!li) {
 		fprintf(stderr, "Failed to initialize context\n");
+		udev_unref(udev);
 		return -1;
 	}
 
@@ -96,6 +101,8 @@ int scan(int verbose)
 
 	if (libinput_udev_assign_seat(li, "seat0")) {
 		fprintf(stderr, "Failed to set seat\n");
+		libinput_unref(li);
+		udev_unref(udev);
 		return -1;
 	}
 
