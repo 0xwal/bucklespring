@@ -35,12 +35,20 @@
 #include "json.h"
 
  #define SRC_INVALID INT_MAX
- #define DEFAULT_MUTE_KEYCODE 0x46 /* Scroll Lock */
-
+ #define DEFAULT_MUTE_KEYCODE 0x46
  #define MAX_CACHED_FILES 16
  #define MAX_AUDIO_SAMPLES 4 * 48000 * 60
  #define MAX_KEYCODES 256
  #define MAX_AUDIO_SOURCES (MAX_KEYCODES * 2)
+ #define MAX_DEFINES_KEYCODES 256
+
+ #define ROW_MIDLOC_0 7.5
+ #define ROW_MIDLOC_1 7.5
+ #define ROW_MIDLOC_2 7.5
+ #define ROW_MIDLOC_3 6.5
+ #define ROW_MIDLOC_4 6.5
+ #define ROW_MIDLOC_5 6.5
+ #define ROW_MIDLOC_6 4.5
 
 typedef struct {
     char filename[PATH_MAX];
@@ -68,6 +76,10 @@ static void cleanup_audio_cache(void);
 static void parse_config_json(void);
 static char* get_audio_file_from_config(int code);
 static int get_audio_segment_from_config(int code, int *start_ms, int *duration_ms);
+static int get_random_fallback_segment(int *start_ms, int *duration_ms);
+static int parse_segment_array(struct json_array_s *arr, int *start_ms, int *duration_ms);
+static struct json_object_s* get_defines_object(void);
+static int build_audio_path(char *buf, size_t bufsize, const char *filename);
 static cached_audio_file_t* get_cached_audio_file(const char *filename);
 static ALuint create_buffer_from_ogg_segment(const char *filename, int start_ms, int duration_ms);
 
@@ -95,13 +107,13 @@ static int keyloc[][32] = {
  * Horizontal position on keyboard of the pragmatic center of the row, since keys come in different sizes and shapes
  */
 static double midloc[] = {
-	7.5,
-	7.5,
-	7.5,
-	6.5,
-	6.5,
-	6.5,
-	4.5,
+	ROW_MIDLOC_0,
+	ROW_MIDLOC_1,
+	ROW_MIDLOC_2,
+	ROW_MIDLOC_3,
+	ROW_MIDLOC_4,
+	ROW_MIDLOC_5,
+	ROW_MIDLOC_6,
 };
 
 static int opt_verbose = 0;
@@ -133,14 +145,14 @@ static void cleanup_json_cache(void) {
 }
 
 static void cleanup_audio_cache(void) {
-    int i;
-    for (i = 0; i < cached_audio_count; i++) {
-        if (cached_audio_files[i].samples) {
-            free(cached_audio_files[i].samples);
-            cached_audio_files[i].samples = NULL;
-        }
-    }
-    cached_audio_count = 0;
+	int i;
+	for (i = 0; i < cached_audio_count; i++) {
+		if (cached_audio_files[i].samples) {
+			free(cached_audio_files[i].samples);
+			cached_audio_files[i].samples = NULL;
+		}
+	}
+	cached_audio_count = 0;
 }
 
 static void parse_config_json(void) {
@@ -239,301 +251,280 @@ static void parse_config_json(void) {
     printd("config: key_define_type_single=%d main_sound=%s", config_key_define_type_single, config_main_sound_file ? config_main_sound_file : "(null)");
 }
 
+static int build_audio_path(char *buf, size_t bufsize, const char *filename) {
+	int result = snprintf(buf, bufsize, "%s/%s", opt_path_audio, filename);
+	if (result < 0 || (size_t)result >= bufsize) {
+		fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
+		return -1;
+	}
+	return 0;
+}
+
+static int parse_segment_array(struct json_array_s *arr, int *start_ms, int *duration_ms) {
+	if (!arr || arr->length < 2) return 0;
+	struct json_array_element_s *start_elem = arr->start;
+	struct json_array_element_s *duration_elem = start_elem->next;
+	if (!start_elem || !duration_elem) return 0;
+	struct json_number_s *start_num = json_value_as_number(start_elem->value);
+	struct json_number_s *duration_num = json_value_as_number(duration_elem->value);
+	if (!start_num || !duration_num) return 0;
+	*start_ms = (int)strtod(start_num->number, NULL);
+	*duration_ms = (int)strtod(duration_num->number, NULL);
+	return 1;
+}
+
+static struct json_object_s* get_defines_object(void) {
+	if (!config_json_cache) return NULL;
+	struct json_object_s *root = json_value_as_object(config_json_cache);
+	if (!root) return NULL;
+	struct json_object_element_s *elem = root->start;
+	while (elem) {
+		if (strcmp(elem->name->string, "defines") == 0) {
+			return json_value_as_object(elem->value);
+		}
+		elem = elem->next;
+	}
+	return NULL;
+}
+
 static char* get_audio_file_from_config(int code) {
-    parse_config_json();
-    if (!config_json_cache) return NULL;
+	parse_config_json();
 
-    struct json_object_s *root = json_value_as_object(config_json_cache);
-    if (!root) return NULL;
+	struct json_object_s *defines_obj = get_defines_object();
+	if (!defines_obj) return NULL;
 
-    struct json_object_element_s *defines_elem = root->start;
-    while (defines_elem) {
-        if (strcmp(defines_elem->name->string, "defines") == 0) {
-            struct json_object_s *defines_obj = json_value_as_object(defines_elem->value);
-            if (!defines_obj) return NULL;
+	char code_str[32];
+	snprintf(code_str, sizeof(code_str), "%d", code);
 
-            char code_str[32];
-            snprintf(code_str, sizeof(code_str), "%d", code);
+	struct json_object_element_s *elem = defines_obj->start;
+	while (elem) {
+		if (strcmp(elem->name->string, code_str) == 0) {
+			struct json_string_s *value_str = json_value_as_string(elem->value);
+			if (value_str) {
+				char *result = malloc(value_str->string_size + 1);
+				if (result) {
+					strncpy(result, value_str->string, value_str->string_size);
+					result[value_str->string_size] = '\0';
+					return result;
+				}
+			}
+		}
+		elem = elem->next;
+	}
 
-            struct json_object_element_s *elem = defines_obj->start;
-            while (elem) {
-                if (strcmp(elem->name->string, code_str) == 0) {
-                    struct json_string_s *value_str = json_value_as_string(elem->value);
-                    if (value_str) {
-                         char *result = malloc(value_str->string_size + 1);
-                         if (result) {
-                             strncpy(result, value_str->string, value_str->string_size);
-                             result[value_str->string_size] = '\0';
-                             return result;
-                         }
-                    }
-                }
-                elem = elem->next;
-            }
-            break;
-        }
-        defines_elem = defines_elem->next;
-    }
-
-    return NULL;
+	return NULL;
 }
 
 static int get_audio_segment_from_config(int code, int *start_ms, int *duration_ms) {
-    parse_config_json();
+	parse_config_json();
 
-    if (!config_key_define_type_single || !config_json_cache) {
-        return 0;
-    }
+	if (!config_key_define_type_single) return 0;
 
-    struct json_object_s *root = json_value_as_object(config_json_cache);
-    if (!root) return 0;
+	struct json_object_s *defines_obj = get_defines_object();
+	if (!defines_obj) return 0;
 
-    struct json_object_element_s *defines_elem = root->start;
-    while (defines_elem) {
-        if (strcmp(defines_elem->name->string, "defines") == 0) {
-            struct json_object_s *defines_obj = json_value_as_object(defines_elem->value);
-            if (!defines_obj) return 0;
+	char code_str[32];
+	snprintf(code_str, sizeof(code_str), "%d", code);
 
-            char code_str[32];
-            snprintf(code_str, sizeof(code_str), "%d", code);
+	struct json_object_element_s *code_elem = defines_obj->start;
+	while (code_elem) {
+		if (strcmp(code_elem->name->string, code_str) == 0) {
+			struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
+			if (parse_segment_array(segment_arr, start_ms, duration_ms)) {
+				return 1;
+			}
+		}
+		code_elem = code_elem->next;
+	}
 
-            struct json_object_element_s *code_elem = defines_obj->start;
-            while (code_elem) {
-                if (strcmp(code_elem->name->string, code_str) == 0) {
-                    struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
-                    if (segment_arr && segment_arr->length >= 2) {
-                        struct json_array_element_s *start_elem = segment_arr->start;
-                        struct json_array_element_s *duration_elem = start_elem->next;
-
-                        if (start_elem && duration_elem) {
-                            struct json_number_s *start_num = json_value_as_number(start_elem->value);
-                            struct json_number_s *duration_num = json_value_as_number(duration_elem->value);
-                            if (start_num && duration_num) {
-                                *start_ms = (int)strtod(start_num->number, NULL);
-                                *duration_ms = (int)strtod(duration_num->number, NULL);
-                                return 1;
-                            }
-                        }
-                    }
-                }
-                code_elem = code_elem->next;
-            }
-            break;
-        }
-        defines_elem = defines_elem->next;
-    }
-
-    return 0;
+	return 0;
 }
 
 static int get_random_fallback_segment(int *start_ms, int *duration_ms) {
-    parse_config_json();
+	parse_config_json();
 
-    if (!config_key_define_type_single || !config_json_cache) {
-        return 0;
-    }
+	if (!config_key_define_type_single) return 0;
 
-    struct json_object_s *root = json_value_as_object(config_json_cache);
-    if (!root) return 0;
+	struct json_object_s *defines_obj = get_defines_object();
+	if (!defines_obj) return 0;
 
-    struct json_object_element_s *defines_elem = root->start;
-    while (defines_elem) {
-        if (strcmp(defines_elem->name->string, "defines") == 0) {
-            struct json_object_s *defines_obj = json_value_as_object(defines_elem->value);
-            if (!defines_obj) return 0;
+	int keycodes[MAX_DEFINES_KEYCODES];
+	int count = 0;
 
-            int keycodes[256];
-            int count = 0;
+	struct json_object_element_s *code_elem = defines_obj->start;
+	while (code_elem && count < MAX_DEFINES_KEYCODES) {
+		struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
+		if (segment_arr && segment_arr->length >= 2) {
+			keycodes[count++] = atoi(code_elem->name->string);
+		}
+		code_elem = code_elem->next;
+	}
 
-            struct json_object_element_s *code_elem = defines_obj->start;
-            while (code_elem && count < 256) {
-                struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
-                if (segment_arr && segment_arr->length >= 2) {
-                    keycodes[count++] = atoi(code_elem->name->string);
-                }
-                code_elem = code_elem->next;
-            }
+	if (count == 0) return 0;
 
-            if (count > 0) {
-                int random_idx = rand() % count;
-                int random_code = keycodes[random_idx];
+	int random_idx = rand() % count;
+	int random_code = keycodes[random_idx];
 
-                code_elem = defines_obj->start;
-                while (code_elem) {
-                    if (atoi(code_elem->name->string) == random_code) {
-                        struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
-                        if (segment_arr && segment_arr->length >= 2) {
-                            struct json_array_element_s *start_elem = segment_arr->start;
-                            struct json_array_element_s *duration_elem = start_elem->next;
+	code_elem = defines_obj->start;
+	while (code_elem) {
+		if (atoi(code_elem->name->string) == random_code) {
+			struct json_array_s *segment_arr = json_value_as_array(code_elem->value);
+			if (parse_segment_array(segment_arr, start_ms, duration_ms)) {
+				printd("fallback: using random keycode %d (start=%d, duration=%d)", random_code, *start_ms, *duration_ms);
+				return 1;
+			}
+			break;
+		}
+		code_elem = code_elem->next;
+	}
 
-                            if (start_elem && duration_elem) {
-                                struct json_number_s *start_num = json_value_as_number(start_elem->value);
-                                struct json_number_s *duration_num = json_value_as_number(duration_elem->value);
-                                if (start_num && duration_num) {
-                                    *start_ms = (int)strtod(start_num->number, NULL);
-                                    *duration_ms = (int)strtod(duration_num->number, NULL);
-                                    printd("fallback: using random keycode %d (start=%d, duration=%d)", random_code, *start_ms, *duration_ms);
-                                    return 1;
-                                }
-                            }
-                        }
-                        break;
-                    }
-                    code_elem = code_elem->next;
-                }
-            }
-            break;
-        }
-        defines_elem = defines_elem->next;
-    }
-
-    return 0;
+	return 0;
 }
 
 static cached_audio_file_t* get_cached_audio_file(const char *filename) {
-    int i;
-    for (i = 0; i < cached_audio_count; i++) {
-        if (strcmp(cached_audio_files[i].filename, filename) == 0) {
-            cached_audio_files[i].ref_count++;
-            return &cached_audio_files[i];
-        }
-    }
-    return NULL;
+	int i;
+	for (i = 0; i < cached_audio_count; i++) {
+		if (strcmp(cached_audio_files[i].filename, filename) == 0) {
+			cached_audio_files[i].ref_count++;
+			return &cached_audio_files[i];
+		}
+	}
+	return NULL;
 }
 
 static int read_ogg_vorbis(const char *filename, short **samples_out, int *sample_count_out, int *sample_rate_out, int *channels_out) {
-    OggVorbis_File vf;
-    FILE *file = fopen(filename, "rb");
-    if (!file) {
-        return -1;
-    }
+	OggVorbis_File vf;
+	FILE *file = fopen(filename, "rb");
+	if (!file) {
+		return -1;
+	}
 
-    if (ov_open(file, &vf, NULL, 0) < 0) {
-        fclose(file);
-        return -1;
-    }
+	if (ov_open(file, &vf, NULL, 0) < 0) {
+		fclose(file);
+		return -1;
+	}
 
-    vorbis_info *vi = ov_info(&vf, -1);
-    if (!vi) {
-        ov_clear(&vf);
-        return -1;
-    }
+	vorbis_info *vi = ov_info(&vf, -1);
+	if (!vi) {
+		ov_clear(&vf);
+		return -1;
+	}
 
-    ogg_int64_t pcm_total = ov_pcm_total(&vf, -1);
-    if (pcm_total < 0 || pcm_total > MAX_AUDIO_SAMPLES) {
-        ov_clear(&vf);
-        return -1;
-    }
+	ogg_int64_t pcm_total = ov_pcm_total(&vf, -1);
+	if (pcm_total < 0 || pcm_total > MAX_AUDIO_SAMPLES) {
+		ov_clear(&vf);
+		return -1;
+	}
 
-    int channels = vi->channels;
-    int sample_rate = vi->rate;
-    int sample_count = (int)pcm_total;
-    size_t total_samples = (size_t)sample_count * (size_t)channels;
-    if (sample_count > 0 && channels > 0 && total_samples > SIZE_MAX / sizeof(short)) {
-        ov_clear(&vf);
-        return -1;
-    }
+	int channels = vi->channels;
+	int sample_rate = vi->rate;
+	int sample_count = (int)pcm_total;
+	size_t total_samples = (size_t)sample_count * (size_t)channels;
+	if (sample_count > 0 && channels > 0 && total_samples > SIZE_MAX / sizeof(short)) {
+		ov_clear(&vf);
+		return -1;
+	}
 
-    short *samples = malloc(total_samples * sizeof(short));
-    if (!samples) {
-        ov_clear(&vf);
-        return -1;
-    }
+	short *samples = malloc(total_samples * sizeof(short));
+	if (!samples) {
+		ov_clear(&vf);
+		return -1;
+	}
 
-    ogg_int64_t samples_read = 0;
-    int current_section = 0;
-    char buffer[4096];
+	ogg_int64_t samples_read = 0;
+	int current_section = 0;
+	char buffer[4096];
 
-    while (samples_read < pcm_total) {
-        long bytes_read = ov_read(&vf, buffer, sizeof(buffer), 0, 2, 1, &current_section);
-        if (bytes_read < 0) {
-            free(samples);
-            ov_clear(&vf);
-            return -1;
-        }
-        if (bytes_read == 0) {
-            break;
-        }
+	while (samples_read < pcm_total) {
+		long bytes_read = ov_read(&vf, buffer, sizeof(buffer), 0, 2, 1, &current_section);
+		if (bytes_read < 0) {
+			free(samples);
+			ov_clear(&vf);
+			return -1;
+		}
+		if (bytes_read == 0) {
+			break;
+		}
 
-        int samples_in_chunk = bytes_read / (2 * channels);
-        short *dest = samples + samples_read * channels;
-        short *src = (short *)buffer;
-        for (int i = 0; i < samples_in_chunk * channels; i++) {
-            dest[i] = src[i];
-        }
-        samples_read += samples_in_chunk;
-    }
+		int samples_in_chunk = bytes_read / (2 * channels);
+		short *dest = samples + samples_read * channels;
+		short *src = (short *)buffer;
+		for (int i = 0; i < samples_in_chunk * channels; i++) {
+			dest[i] = src[i];
+		}
+		samples_read += samples_in_chunk;
+	}
 
-    ov_clear(&vf);
+	ov_clear(&vf);
 
-    *samples_out = samples;
-    *sample_count_out = sample_count;
-    *sample_rate_out = sample_rate;
-    *channels_out = channels;
+	*samples_out = samples;
+	*sample_count_out = sample_count;
+	*sample_rate_out = sample_rate;
+	*channels_out = channels;
 
-    return 0;
+	return 0;
 }
 
 static ALuint create_buffer_from_ogg_segment(const char *filename, int start_ms, int duration_ms) {
-    cached_audio_file_t *cached = get_cached_audio_file(filename);
+	cached_audio_file_t *cached = get_cached_audio_file(filename);
 
-    if (!cached && cached_audio_count < MAX_CACHED_FILES) {
-        cached = &cached_audio_files[cached_audio_count++];
-        snprintf(cached->filename, sizeof(cached->filename), "%s", filename);
-        cached->samples = NULL;
-        cached->sample_count = 0;
-        cached->ref_count = 1;
+	if (!cached && cached_audio_count < MAX_CACHED_FILES) {
+		cached = &cached_audio_files[cached_audio_count++];
+		snprintf(cached->filename, sizeof(cached->filename), "%s", filename);
+		cached->samples = NULL;
+		cached->sample_count = 0;
+		cached->ref_count = 1;
 
-        if (read_ogg_vorbis(filename, &cached->samples, &cached->sample_count, &cached->sample_rate, &cached->channels) < 0) {
-            printd("Failed to decode OGG file: %s", filename);
-            return 0;
-        }
-    }
+		if (read_ogg_vorbis(filename, &cached->samples, &cached->sample_count, &cached->sample_rate, &cached->channels) < 0) {
+			printd("Failed to decode OGG file: %s", filename);
+			return 0;
+		}
+	}
 
-    if (!cached || !cached->samples) {
-        return 0;
-    }
+	if (!cached || !cached->samples) {
+		return 0;
+	}
 
-    int start_sample = (int64_t)start_ms * cached->sample_rate / 1000;
-    int duration_sample = (int64_t)duration_ms * cached->sample_rate / 1000;
+	int start_sample = (int64_t)start_ms * cached->sample_rate / 1000;
+	int duration_sample = (int64_t)duration_ms * cached->sample_rate / 1000;
 
-    if (start_sample >= cached->sample_count) {
-        return 0;
-    }
+	if (start_sample >= cached->sample_count) {
+		return 0;
+	}
 
-    if (start_sample + duration_sample > cached->sample_count) {
-        duration_sample = cached->sample_count - start_sample;
-    }
+	if (start_sample + duration_sample > cached->sample_count) {
+		duration_sample = cached->sample_count - start_sample;
+	}
 
-    size_t segment_samples = (size_t)duration_sample * (size_t)cached->channels;
-    if (duration_sample > 0 && cached->channels > 0 && segment_samples > SIZE_MAX / sizeof(short)) {
-        return 0;
-    }
-    short *segment_data = malloc(segment_samples * sizeof(short));
-    if (!segment_data) {
-        return 0;
-    }
+	size_t segment_samples = (size_t)duration_sample * (size_t)cached->channels;
+	if (duration_sample > 0 && cached->channels > 0 && segment_samples > SIZE_MAX / sizeof(short)) {
+		return 0;
+	}
+	short *segment_data = malloc(segment_samples * sizeof(short));
+	if (!segment_data) {
+		return 0;
+	}
 
-    size_t start_offset = (size_t)start_sample * (size_t)cached->channels;
-    size_t total_cached_samples = (size_t)cached->sample_count * (size_t)cached->channels;
-    size_t segment_bytes = segment_samples * sizeof(short);
+	size_t start_offset = (size_t)start_sample * (size_t)cached->channels;
+	size_t total_cached_samples = (size_t)cached->sample_count * (size_t)cached->channels;
+	size_t segment_bytes = segment_samples * sizeof(short);
 
-    if (start_offset > total_cached_samples || 
-        start_offset + segment_samples > total_cached_samples) {
-        free(segment_data);
-        return 0;
-    }
+	if (start_offset > total_cached_samples ||
+	    start_offset + segment_samples > total_cached_samples) {
+		free(segment_data);
+		return 0;
+	}
 
-    memcpy(segment_data, cached->samples + start_offset, segment_bytes);
+	memcpy(segment_data, cached->samples + start_offset, segment_bytes);
 
-    ALuint buffer = 0;
-    alGenBuffers(1, &buffer);
-    ALenum format = (cached->channels == 2) ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
-    alBufferData(buffer, format, segment_data, segment_samples * sizeof(short), cached->sample_rate);
+	ALuint buffer = 0;
+	alGenBuffers(1, &buffer);
+	ALenum format = (cached->channels == 2) ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
+	alBufferData(buffer, format, segment_data, segment_samples * sizeof(short), cached->sample_rate);
 
-    free(segment_data);
+	free(segment_data);
 
-    return buffer;
+	return buffer;
 }
 
 static const char short_opts[] = "d:fg:hlm:Mp:s:cuvw:";
@@ -974,20 +965,18 @@ int play(int code, int press)
 		char *custom_name = get_audio_file_from_config(code);
 		printd("custom_name=%s config_key_define_type_single=%d", custom_name, config_key_define_type_single);
 
- 		if (custom_name) {
- 			int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, custom_name);
- 			if (result < 0 || result >= sizeof(fname)) {
- 				fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
- 				free(custom_name);
- 				src[idx] = SRC_INVALID;
- 				return -1;
- 			}
+		if (custom_name) {
+			if (build_audio_path(fname, sizeof(fname), custom_name) < 0) {
+				free(custom_name);
+				src[idx] = SRC_INVALID;
+				return -1;
+			}
 
 			printd("Loading audio file \"%s\"", fname);
 
 			buffer = alureCreateBufferFromFile(fname);
 		} else {
-  			int has_segment = get_audio_segment_from_config(code, &start_ms, &duration_ms);
+			int has_segment = get_audio_segment_from_config(code, &start_ms, &duration_ms);
 			printd("has_segment=%d start_ms=%d duration_ms=%d config_main_sound_file=%s",
 			       has_segment, start_ms, duration_ms, config_main_sound_file ? config_main_sound_file : "(null)");
 
@@ -996,22 +985,20 @@ int play(int code, int press)
 				printd("fallback_segment=%d start_ms=%d duration_ms=%d", has_segment, start_ms, duration_ms);
 			}
 
-  			if (has_segment && config_main_sound_file) {
-  				int result = snprintf(fname, sizeof(fname), "%s/%s", opt_path_audio, config_main_sound_file);
-  				if (result < 0 || result >= sizeof(fname)) {
-  					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
-  					src[idx] = SRC_INVALID;
-  					return -1;
-  				}
+			if (has_segment && config_main_sound_file) {
+				if (build_audio_path(fname, sizeof(fname), config_main_sound_file) < 0) {
+					src[idx] = SRC_INVALID;
+					return -1;
+				}
 
 				printd("Loading OGG segment from \"%s\" start=%dms duration=%dms", fname, start_ms, duration_ms);
 
 				buffer = create_buffer_from_ogg_segment(fname, start_ms, duration_ms);
-  			} else {
+			} else {
 				char *name = map_code_to_name(code);
-				int result = snprintf(fname, sizeof(fname), "%s/%s.wav", opt_path_audio, name);
-				if (result < 0 || result >= sizeof(fname)) {
-					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
+				char wav_name[PATH_MAX];
+				snprintf(wav_name, sizeof(wav_name), "%s.wav", name);
+				if (build_audio_path(fname, sizeof(fname), wav_name) < 0) {
 					src[idx] = SRC_INVALID;
 					return -1;
 				}
@@ -1022,14 +1009,12 @@ int play(int code, int press)
 			}
 		}
 
- 		if (buffer == 0) {
- 			if(opt_fallback_sound) {
- 				int result = snprintf(fname, sizeof(fname), "%s/fallback.wav", opt_path_audio);
- 				if (result < 0 || result >= sizeof(fname)) {
- 					fprintf(stderr, "Error: audio path too long (would be %d bytes)\n", result);
- 					src[idx] = SRC_INVALID;
- 					return -1;
- 				}
+		if (buffer == 0) {
+			if (opt_fallback_sound) {
+				if (build_audio_path(fname, sizeof(fname), "fallback.wav") < 0) {
+					src[idx] = SRC_INVALID;
+					return -1;
+				}
 				buf[idx] = alureCreateBufferFromFile(fname);
 			} else if (custom_name) {
 				fprintf(stderr, "Error opening audio file \"%s\": %s\n", fname, alureGetErrorString());
